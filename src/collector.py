@@ -184,14 +184,12 @@ class ApartmentDataCollector:
         }
         df = df.rename(columns=rename_map)
 
-    # 시군구 조합 (구이름 + 법정동)
         code_to_name = {v: k for k, v in SEOUL_SIGUNGU_CODES.items()}
         if "수집_시군구코드" in df.columns and "법정동" in df.columns:
             df["시군구"] = df["수집_시군구코드"].map(
             lambda c: f"서울특별시 {code_to_name.get(c, c)} "
             ) + df["법정동"].fillna("")
 
-    # 계약년월 생성
         if "년" in df.columns and "월" in df.columns:
             df["계약년월"] = (
             df["년"].astype(str).str.zfill(4) +
