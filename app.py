@@ -19,6 +19,7 @@ from src.collector import (
     INCHEON_SIGUNGU_CODES,
     GYEONGGI_SIGUNGU_CODES,
     METRO5_SIGUNGU_CODES,
+    ALL_SIGUNGU_CODES,
 )
 from src.pipeline import DemandForecastingPipeline
 
@@ -28,12 +29,52 @@ API_KEY = os.getenv("API_KEY", "")
 APT_BASIC_INFO_API_KEY = os.getenv("APT_BASIC_INFO_API_KEY", "")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "qwen2.5:3b")
+# /api/collect(전국 재수집) 보호용 관리자 토큰. 비워두면(로컬 개발) 인증 없이 허용.
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+
+RAW_TRADE_PATH = "data/raw_api_collected_all.csv"
+RAW_RENT_PATH = "data/raw_rent_collected_all.csv"
+RESULT_PATH = "data/인테리어_수요점수_결과.csv"
+SIDO_SUMMARY_PATH = "data/시도별_수요집계_요약.csv"
+
+
+def _atomic_write_csv(df: pd.DataFrame, path: str) -> None:
+    """임시 파일에 먼저 쓰고 성공 시에만 원자적으로 교체 — 쓰는 도중 실패해도
+    기존 결과 파일이 훼손되거나 부분 상태로 노출되지 않는다."""
+    tmp_path = f"{path}.tmp"
+    df.to_csv(tmp_path, index=False, encoding="utf-8-sig")
+    os.replace(tmp_path, path)
+
+
+def _upsert_raw(existing_path: str, df_new: pd.DataFrame) -> pd.DataFrame:
+    """새로 수집한 (수집_시군구코드, 수집_연월) 조합의 기존 행만 제거하고 새 데이터로
+    교체한다. 나머지 지역·기간 데이터는 그대로 유지되므로 부분 수집이 전국 결과를
+    덮어쓰지 않는다."""
+    if df_new is None or df_new.empty:
+        if os.path.exists(existing_path):
+            return pd.read_csv(existing_path, encoding="utf-8-sig", low_memory=False)
+        return pd.DataFrame()
+
+    if not os.path.exists(existing_path):
+        return df_new
+
+    df_existing = pd.read_csv(existing_path, encoding="utf-8-sig", low_memory=False)
+    new_keys = set(
+        df_new["수집_시군구코드"].astype(str) + "|" + df_new["수집_연월"].astype(str)
+    )
+    existing_keys = (
+        df_existing["수집_시군구코드"].astype(str) + "|" + df_existing["수집_연월"].astype(str)
+    )
+    df_existing = df_existing[~existing_keys.isin(new_keys)]
+    return pd.concat([df_existing, df_new], ignore_index=True)
 NAVER_MAP_CLIENT_ID = os.getenv("NAVER_MAP_CLIENT_ID", "")
 
-CHAT_DB_PATH = os.path.join(os.path.dirname(__file__), "data", "chat_history.db")
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+CHAT_DB_PATH = os.path.join(DATA_DIR, "chat_history.db")
 
 
 def init_chat_db():
+    os.makedirs(DATA_DIR, exist_ok=True)
     conn = sqlite3.connect(CHAT_DB_PATH)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS chat_logs (
@@ -114,7 +155,12 @@ def get_demand():
         if sido:
             df = df[df["시도"] == sido]
 
-        top = int(request.args.get("top", 25))
+        try:
+            top = int(request.args.get("top", 25))
+        except ValueError:
+            return jsonify({"status": "error", "message": "top은 정수여야 합니다."}), 400
+        if top < 1:
+            return jsonify({"status": "error", "message": "top은 1 이상이어야 합니다."}), 400
         df = df.head(top)
 
         return jsonify({
@@ -163,6 +209,9 @@ def get_sido_summary():
 @app.route("/api/collect", methods=["POST"])
 def collect():
     try:
+        if ADMIN_TOKEN and request.headers.get("X-Admin-Token", "") != ADMIN_TOKEN:
+            return jsonify({"status": "error", "message": "관리자 인증이 필요합니다."}), 401
+
         body = request.get_json() or {}
         months = int(body.get("months", 12))
         sigungu_code = body.get("sigungu_code", None)
@@ -173,41 +222,53 @@ def collect():
         collector = ApartmentDataCollector(api_key=API_KEY)
 
         if sigungu_code:
-            codes = {k: v for k, v in SEOUL_SIGUNGU_CODES.items() if v == sigungu_code}
+            codes = {k: v for k, v in ALL_SIGUNGU_CODES.items() if v == sigungu_code}
+            if not codes:
+                return jsonify({"status": "error", "message": f"알 수 없는 시군구 코드: {sigungu_code}"}), 400
         else:
-            codes = SEOUL_SIGUNGU_CODES
+            # 기본값: 서울/인천/경기/5대 광역시 전체(102개 시군구) — 특정 지역으로
+            # 좁혀서 전국 결과를 덮어쓰는 사고를 방지한다.
+            codes = ALL_SIGUNGU_CODES
 
-        # 매매 실거래가 수집 & 정규화
-        df_raw = collector.fetch_recent_months(
-            sigungu_codes=codes,
-            months=months,
-            save_path="data/raw_api_collected.csv"
-        )
-        df_normalized = collector.normalize_columns(df_raw)
+        # 매매/전월세 실거래가 수집 (요청 범위만 — 저장은 아래에서 upsert로 처리)
+        df_raw_new = collector.fetch_recent_months(sigungu_codes=codes, months=months, save_path=None)
+        if df_raw_new.empty:
+            return jsonify({"status": "error", "message": "수집된 매매 데이터가 없습니다. API 키/지역 코드를 확인하세요."}), 502
 
-        # 전월세 실거래가 수집 & 정규화
-        df_rent_raw = collector.fetch_recent_months_rent(
-            sigungu_codes=codes,
-            months=months,
-            save_path="data/raw_rent_collected.csv"
-        )
-        df_rent_normalized = (
-            collector.normalize_rent_columns(df_rent_raw) if not df_rent_raw.empty else None
-        )
+        df_rent_raw_new = collector.fetch_recent_months_rent(sigungu_codes=codes, months=months, save_path=None)
 
-        # 파이프라인 실행
+        # 기존 전국 원본과 upsert — 재수집한 (시군구, 연월)만 교체되고 나머지 지역은 유지된다.
+        df_trade_all = _upsert_raw(RAW_TRADE_PATH, df_raw_new)
+        df_rent_all = _upsert_raw(RAW_RENT_PATH, df_rent_raw_new)
+
+        # 파이프라인은 항상 전국 데이터로 재실행하므로, 부분 수집이어도 최종 결과는 전국 범위를 유지한다.
         pipeline = DemandForecastingPipeline(
             supply_path="data/한국부동산원_주택공급정보_입주예정물량정보_20251231.csv"
         )
-        df_result, sido_summary = pipeline.run(df_transactions=df_normalized, df_rent=df_rent_normalized)
+        df_result, sido_summary = pipeline.run(df_transactions=df_trade_all, df_rent=df_rent_all)
 
-        # 결과 저장
-        df_result.to_csv("data/인테리어_수요점수_결과.csv", index=False, encoding="utf-8-sig")
-        sido_summary.to_csv("data/시도별_수요집계_요약.csv", index=False, encoding="utf-8-sig")
+        # 소상공인_인테리어업체수는 파이프라인 산출물이 아니라 별도 API로 수집한 값이라
+        # 여기서 API를 재호출하지 않고 기존 결과 CSV에서 그대로 이어받는다.
+        if os.path.exists(RESULT_PATH):
+            df_prev = pd.read_csv(RESULT_PATH, encoding="utf-8-sig")
+            if "소상공인_인테리어업체수" in df_prev.columns:
+                df_result = df_result.merge(
+                    df_prev[["시도", "시군구", "소상공인_인테리어업체수"]],
+                    on=["시도", "시군구"], how="left",
+                )
+                df_result["소상공인_인테리어업체수"] = df_result["소상공인_인테리어업체수"].fillna(0).astype(int)
+
+        # 원본·결과 모두 임시 파일에 먼저 쓰고 원자적으로 교체 — 중간에 실패해도 기존 파일 보존
+        _atomic_write_csv(df_trade_all, RAW_TRADE_PATH)
+        _atomic_write_csv(df_rent_all, RAW_RENT_PATH)
+        _atomic_write_csv(df_result, RESULT_PATH)
+        _atomic_write_csv(sido_summary, SIDO_SUMMARY_PATH)
 
         return jsonify({
             "status": "ok",
-            "collected": len(df_raw),
+            "collected_regions": len(codes),
+            "collected_trade_rows": len(df_raw_new),
+            "total_sigungu": len(df_result),
             "top5": df_result.head(5).to_dict(orient="records"),
         })
 
@@ -222,11 +283,13 @@ def search():
 
         if not q:
             return jsonify({"status": "error", "message": "검색어를 입력하세요."}), 400
+        if len(q) > 50:
+            return jsonify({"status": "error", "message": "검색어가 너무 깁니다."}), 400
 
         if search_type == "apt":
-            # 단지명 검색 — 원본 데이터에서 검색
-            df = pd.read_csv("data/raw_api_collected.csv", encoding="utf-8-sig")
-            mask = df["aptNm"].str.contains(q, na=False)
+            # 단지명 검색 — 전국 원본 데이터에서 검색
+            df = pd.read_csv(RAW_TRADE_PATH, encoding="utf-8-sig", low_memory=False)
+            mask = df["aptNm"].str.contains(q, na=False, regex=False)
             df_filtered = df[mask][["aptNm", "umdNm", "dealAmount", "buildYear", "excluUseAr", "dealYear", "dealMonth"]].copy()
             df_filtered.columns = ["단지명", "법정동", "거래금액_만원", "건축년도", "전용면적", "년", "월"]
             df_filtered = df_filtered.head(50)
@@ -234,8 +297,8 @@ def search():
             # 지역 검색 — 수요 점수 결과에서 검색
             df = pd.read_csv("data/인테리어_수요점수_결과.csv", encoding="utf-8-sig")
             mask = (
-                df["시도"].str.contains(q, na=False) |
-                df["시군구"].str.contains(q, na=False)
+                df["시도"].str.contains(q, na=False, regex=False) |
+                df["시군구"].str.contains(q, na=False, regex=False)
             )
             df_filtered = df[mask]
 
@@ -258,7 +321,7 @@ CHAT_STOPWORDS = {
     "그리고", "그럼", "그래서", "에서", "에게", "에는", "으로", "한테", "대해",
 }
 
-def find_apartment_context(message: str, raw_path: str = "data/raw_api_collected.csv", limit: int = 10) -> str:
+def find_apartment_context(message: str, raw_path: str = RAW_TRADE_PATH, limit: int = 10) -> str:
     """메시지에 포함된 단지명/법정동 키워드로 원본 실거래 데이터를 검색해 컨텍스트 문자열을 만든다.
     공백 차이나 약간의 오타가 있어도 인식할 수 있도록 정규화 매칭과 유사도 매칭을 함께 사용한다."""
     if not os.path.exists(raw_path):
@@ -611,8 +674,10 @@ def guide_chat():
 
 
 if __name__ == "__main__":
+    # 같은 와이파이의 다른 기기(모바일 등)에서 접속하려면
+    # .env에 FLASK_HOST=0.0.0.0 을 설정할 것 (기본값은 로컬만 허용)
     app.run(
-        host="0.0.0.0",  # 외부 접속 허용 (배포 시 필요)
-        port=8300,
-        debug=True,      # 코드 변경 시 자동 재시작
+        host=os.getenv("FLASK_HOST", "127.0.0.1"),
+        port=int(os.getenv("FLASK_PORT", "8300")),
+        debug=os.getenv("FLASK_DEBUG", "false").lower() == "true",
     )

@@ -4,28 +4,48 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>오늘의집 | 첫 집 구매 가이드</title>
+    <script>(function(){var t=localStorage.getItem('o2o-theme')||'dark';document.documentElement.setAttribute('data-theme',t);})();</script>
     <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Noto+Sans+KR:wght@300;400;500;700&display=swap" rel="stylesheet">
     <style>
         :root {
-            --bg:       #080e1a;
-            --surface:  #0d1626;
-            --surface2: #111e33;
-            --surface3: #162240;
-            --border:   #1e3050;
-            --border2:  #253d66;
-            --accent:   #f97316;
-            --accent2:  #fbbf24;
-            --blue:     #38bdf8;
-            --green:    #34d399;
-            --purple:   #a78bfa;
-            --red:      #f87171;
-            --teal:     #2dd4bf;
-            --text:     #e2e8f0;
-            --text2:    #94a3b8;
-            --muted:    #64748b;
-            --mono:     'DM Mono', monospace;
-            --body:     'Noto Sans KR', sans-serif;
+            --bg:        #080e1a;
+            --surface:   #0d1626;
+            --surface2:  #111e33;
+            --surface3:  #162240;
+            --border:    #1e3050;
+            --border2:   #253d66;
+            --accent:    #f97316;
+            --accent2:   #fbbf24;
+            --blue:      #38bdf8;
+            --green:     #34d399;
+            --purple:    #a78bfa;
+            --red:       #f87171;
+            --teal:      #2dd4bf;
+            --text:      #e2e8f0;
+            --text2:     #94a3b8;
+            --muted:     #64748b;
+            --mono:      'DM Mono', monospace;
+            --body:      'Noto Sans KR', sans-serif;
+            --header-bg: rgba(8,14,26,.92);
         }
+        [data-theme="light"] {
+            --bg:        #f0f4f8;
+            --surface:   #ffffff;
+            --surface2:  #f1f5f9;
+            --surface3:  #e8edf2;
+            --border:    #dde3ea;
+            --border2:   #c9d2dc;
+            --accent2:   #d97706;
+            --green:     #059669;
+            --purple:    #7c3aed;
+            --red:       #dc2626;
+            --teal:      #0d9488;
+            --text:      #0f172a;
+            --text2:     #475569;
+            --muted:     #94a3b8;
+            --header-bg: rgba(240,244,248,.95);
+        }
+        [data-theme="light"] .card:hover { box-shadow: 0 0 0 1px var(--border2), 0 8px 32px rgba(0,0,0,.12); }
 
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -261,12 +281,31 @@
             white-space: nowrap;
         }
         .quick-btn:hover { border-color: var(--accent); color: var(--text); }
+
+        /* ── 반응형 (태블릿/모바일) ── */
+        @media (max-width: 768px) {
+            main { grid-template-columns: 1fr !important; padding: 20px 16px !important; gap: 16px !important; }
+            main > div { grid-column: 1 / -1 !important; min-width: 0; }
+            main div[style*="grid-template-columns"] > div,
+            main div[style*="display:grid"] > div,
+            main div[style*="display: grid"] > div { min-width: 0; }
+            #main-header { flex-wrap: wrap; row-gap: 10px; padding: 12px 16px; }
+            #main-header > div:last-child { flex-wrap: wrap; row-gap: 8px; gap: 10px !important; }
+            #main-header nav { order: 3; width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+            #main-header nav::-webkit-scrollbar { display: none; }
+        }
+        @media (max-width: 480px) {
+            main div[style*="grid-template-columns"] { grid-template-columns: 1fr !important; }
+            .hero-title { font-size: 16px; }
+            .rank-table { font-size: 11px; }
+            main { padding: 16px 12px !important; }
+        }
     </style>
 </head>
 <body>
 
 <!-- ══════════════════════════════ HEADER ══════════════════════════════ -->
-<header id="main-header" style="position:sticky;top:0;z-index:100;display:flex;align-items:center;justify-content:space-between;padding:14px 32px;border-bottom:1px solid var(--border);background:rgba(8,14,26,.92);backdrop-filter:blur(12px);">
+<header id="main-header" style="position:sticky;top:0;z-index:100;display:flex;align-items:center;justify-content:space-between;padding:14px 32px;border-bottom:1px solid var(--border);background:var(--header-bg);backdrop-filter:blur(12px);">
     <div style="display:flex;align-items:center;gap:14px;">
         <div style="width:34px;height:34px;background:linear-gradient(135deg,var(--accent),var(--accent2));border-radius:9px;display:flex;align-items:center;justify-content:center;font-size:17px;flex-shrink:0;">🔑</div>
         <div>
@@ -287,6 +326,7 @@
             <div style="width:6px;height:6px;border-radius:50%;background:var(--green);animation:pulse 1.8s ease-in-out infinite;"></div>
             LIVE
         </div>
+        <button id="theme-toggle" onclick="toggleTheme()" title="라이트/다크 모드 전환" style="font-family:var(--mono);font-size:14px;width:32px;height:32px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text2);cursor:pointer;transition:all .15s;flex-shrink:0;">☀️</button>
         <div id="clock" style="font-family:var(--mono);font-size:11px;color:var(--muted);min-width:160px;text-align:right;">—</div>
     </div>
 </header>
@@ -410,6 +450,20 @@
 
 <!-- ══════════════════════════════ SCRIPT ══════════════════════════════ -->
 <script>
+// ── 테마 토글
+const _THEME_KEY = 'o2o-theme';
+function _applyTheme(t) {
+    document.documentElement.setAttribute('data-theme', t);
+    const btn = document.getElementById('theme-toggle');
+    if (btn) btn.textContent = t === 'light' ? '🌙' : '☀️';
+    localStorage.setItem(_THEME_KEY, t);
+}
+function toggleTheme() {
+    const cur = document.documentElement.getAttribute('data-theme') || 'dark';
+    _applyTheme(cur === 'light' ? 'dark' : 'light');
+}
+_applyTheme(localStorage.getItem(_THEME_KEY) || 'dark');
+
 // ── 시계
 function updateClock() {
     const now = new Date();

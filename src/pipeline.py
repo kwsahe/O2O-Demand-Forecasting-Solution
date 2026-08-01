@@ -1,9 +1,12 @@
 import pandas as pd
 import numpy as np
 import warnings
+from datetime import datetime
 warnings.filterwarnings("ignore")
 
-REFERENCE_YEAR = 2025
+# 거래 건마다 실제 계약연도(계약년월)로 노후도를 계산하므로, 이 값은
+# 계약년월을 알 수 없는 경우(외부 주입 DataFrame 등)에만 쓰이는 폴백이다.
+REFERENCE_YEAR = datetime.now().year
 
 SEGMENT_RULES = {
     "New_Apartment":      (0,  5),
@@ -43,6 +46,14 @@ def classify_apartment(age: int) -> str:
         if lo <= age <= hi:
             return seg
     return "Very_Old_Apartment"
+
+def deal_year_from_ymd(df: pd.DataFrame, reference_year: int) -> pd.Series:
+    """'계약년월'(YYYYMM) 컬럼이 있으면 거래연도를 그대로 노후도 기준연도로 쓰고,
+    없으면(외부 주입 DataFrame 등) reference_year로 폴백한다."""
+    if "계약년월" in df.columns:
+        year = pd.to_numeric(df["계약년월"].astype(str).str[:4], errors="coerce")
+        return year.fillna(reference_year)
+    return pd.Series(reference_year, index=df.index)
 
 def min_max_scale(series: pd.Series) -> pd.Series:
     mn, mx = series.min(), series.max()
@@ -180,7 +191,7 @@ class DemandForecastingPipeline:
 
         df.dropna(subset=["건축년도", "거래금액(만원)"], inplace=True)
 
-        df["노후도"] = self.reference_year - df["건축년도"].astype(int)
+        df["노후도"] = deal_year_from_ymd(df, self.reference_year) - df["건축년도"].astype(int)
         df = df[df["노후도"] >= 0].copy()
 
         df["세그먼트"] = df["노후도"].apply(classify_apartment)
@@ -216,12 +227,17 @@ class DemandForecastingPipeline:
                 df["시군구"] = df["수집_시군구코드"].map(
                     lambda c: SIGUNGU_CODE_TO_FULL_NAME.get(str(c), str(c)) + " "
                 ) + df["법정동"].fillna("")
+            if "년" in df.columns and "월" in df.columns:
+                df["계약년월"] = (
+                    df["년"].astype(str).str.zfill(4) +
+                    df["월"].astype(str).str.zfill(2)
+                )
 
-        df = df[[c for c in ["시군구", "건축년도"] if c in df.columns]].copy()
+        df = df[[c for c in ["시군구", "건축년도", "계약년월"] if c in df.columns]].copy()
         df["건축년도"] = pd.to_numeric(df["건축년도"], errors="coerce")
         df.dropna(subset=["건축년도", "시군구"], inplace=True)
 
-        df["노후도"] = self.reference_year - df["건축년도"].astype(int)
+        df["노후도"] = deal_year_from_ymd(df, self.reference_year) - df["건축년도"].astype(int)
         df = df[df["노후도"] >= 0].copy()
         df["세그먼트"] = df["노후도"].apply(classify_apartment)
 
@@ -409,8 +425,14 @@ class DemandForecastingPipeline:
             )
             df = pd.merge(df, agg_renovation, on=["시도", "시군구_코드"], how="left")
             df["대수선이력건수"] = df["대수선이력건수"].fillna(0)
+            # 대수선 이력은 일부 시도(예: 5대 광역시)가 원천 수집 범위 밖일 수 있다.
+            # 이 경우 "0건"이 아니라 "관측 안 됨"이므로 해당 시도는 커버리지 False로 표시해
+            # calculate_demand_score()에서 그 지역만 가중치를 재정규화한다.
+            covered_sido = set(self.df_renovation["시도"].unique())
+            df["대수선이력_covered"] = df["시도"].isin(covered_sido)
         else:
             df["대수선이력건수"] = 0
+            df["대수선이력_covered"] = False
 
         if self.df_interior_company is not None and not self.df_interior_company.empty:
             agg_interior = (
@@ -450,14 +472,23 @@ class DemandForecastingPipeline:
         df["s_전월세거래건수"] = min_max_scale(df["전월세거래건수"])
         df["s_대수선이력"]    = min_max_scale(df["대수선이력건수"])
 
+        # 대수선이력이 원천 미수집 지역("관측 안 됨")이면 해당 지표를 가중합에서
+        # 제외하고, 나머지 지표 가중치 합으로 나눠 그 지역만 재정규화한다.
+        # (수집 안 됨 ≠ 실제로 대수선 이력이 0건 — 동일 취급하면 커버리지 없는
+        # 지역이 구조적으로 불리해진다.)
+        covered = df.get("대수선이력_covered", pd.Series(True, index=df.index)).astype(bool)
+        active_weight = pd.Series(1.0, index=df.index) - (~covered) * w["대수선이력"]
+
         df["인테리어_수요점수"] = (
-            df["s_거래건수"]     * w["거래건수"] +
-            df["s_거래금액"]     * w["거래금액"] +
-            df["s_노후도"]       * w["노후도"]   +
-            df["s_면적"]         * w["면적"]     +
-            df["s_신규입주"]     * w["신규입주"] +
-            df["s_전월세거래건수"] * w["전월세거래건수"] +
-            df["s_대수선이력"]    * w["대수선이력"]
+            (
+                df["s_거래건수"]     * w["거래건수"] +
+                df["s_거래금액"]     * w["거래금액"] +
+                df["s_노후도"]       * w["노후도"]   +
+                df["s_면적"]         * w["면적"]     +
+                df["s_신규입주"]     * w["신규입주"] +
+                df["s_전월세거래건수"] * w["전월세거래건수"] +
+                df["s_대수선이력"]    * w["대수선이력"] * covered
+            ) / active_weight
         ).round(2)
 
         self.df_processed = df.sort_values("인테리어_수요점수", ascending=False)
@@ -470,7 +501,7 @@ class DemandForecastingPipeline:
         result_cols = [
             "시도", "시군구_코드",
             "거래건수", "평균거래금액", "평균노후도", "평균면적",
-            "신규입주", "입주단지", "전월세거래건수", "대수선이력건수", "인테리어업체수",
+            "신규입주", "입주단지", "전월세거래건수", "대수선이력건수", "대수선이력_covered", "인테리어업체수",
             "총인구수", "청년인구비율", "고령인구비율",
             "인테리어_수요점수",
         ]
@@ -478,7 +509,7 @@ class DemandForecastingPipeline:
         df_result.columns = [
             "시도", "시군구",
             "거래건수", "평균거래금액_만원", "평균노후도_년", "평균면적_m2",
-            "신규입주_세대수", "입주단지수", "전월세거래건수", "대수선이력건수", "인테리어업체수",
+            "신규입주_세대수", "입주단지수", "전월세거래건수", "대수선이력건수", "대수선이력_수집됨", "인테리어업체수",
             "총인구수", "청년인구비율", "고령인구비율",
             "인테리어_수요점수",
         ]

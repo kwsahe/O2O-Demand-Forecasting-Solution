@@ -193,6 +193,20 @@ for _d, _prefix in [
     for _name, _code in _d.items():
         METRO5_SIGUNGU_CODES[f"{_prefix}{_name}"] = _code
 
+# 전체 수집 대상 시군구 코드 통합(서울+인천+경기+5대 광역시, 102개).
+# "중구"·"서구" 등 동명 시군구가 여러 시도에 있으므로 시도명을 접두어로 붙여 키 충돌을 막는다.
+# /api/collect가 기본으로 전국을 수집하도록 할 때 사용 — 특정 시도만으로 좁혀서
+# 전국 결과를 덮어쓰는 사고를 방지한다.
+ALL_SIGUNGU_CODES = {}
+for _d, _prefix in [
+    (SEOUL_SIGUNGU_CODES, "서울_"),
+    (INCHEON_SIGUNGU_CODES, "인천_"),
+    (GYEONGGI_SIGUNGU_CODES, "경기_"),
+]:
+    for _name, _code in _d.items():
+        ALL_SIGUNGU_CODES[f"{_prefix}{_name}"] = _code
+ALL_SIGUNGU_CODES.update(METRO5_SIGUNGU_CODES)
+
 def generate_year_months(start_ym: str, end_ym: str) -> list:
     start = datetime.strptime(start_ym, "%Y%m")
     end   = datetime.strptime(end_ym, "%Y%m")
