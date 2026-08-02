@@ -22,17 +22,18 @@ warnings.filterwarnings("ignore")
 
 import requests
 import pandas as pd
-import numpy as np
 from dateutil.relativedelta import relativedelta
 from sklearn.metrics import mean_absolute_percentage_error
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from prophet import Prophet
 import lightgbm as lgb
 
+from src.forecasting import compute_trend, verify_trend_consistency
+
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "qwen2.5:3b")
 
-FUTURE_HORIZON = 3   # 마지막 관측월 이후 몇 개월을 미래 예측할지
+FUTURE_HORIZON = 6   # 마지막 관측월(2026-06) 이후 2026-12까지 미래 예측
 LGB_FEATURES = ["lag1", "lag2", "lag3", "month"]
 
 df = pd.read_csv("data/raw_api_collected_all.csv", encoding="utf-8-sig", low_memory=False)
@@ -40,10 +41,15 @@ df["ym"] = pd.to_datetime(
     df["dealYear"].astype(str) + "-" + df["dealMonth"].astype(str).str.zfill(2) + "-01"
 )
 monthly = df.groupby("ym").size().rename("y").reset_index().rename(columns={"ym": "ds"})
-monthly = monthly[monthly["ds"] < "2026-06-01"].sort_values("ds").reset_index(drop=True)
+data_end_ym = os.getenv("FORECAST_DATA_END_YM")
+if data_end_ym:
+    data_end = pd.to_datetime(f"{data_end_ym}-01") + relativedelta(months=1)
+    monthly = monthly[monthly["ds"] < data_end]
+monthly = monthly.sort_values("ds").reset_index(drop=True)
 
-train = monthly.iloc[:9].copy()
-test = monthly.iloc[9:].copy()
+test_months = min(3, max(1, len(monthly) // 4))
+train = monthly.iloc[:-test_months].copy()
+test = monthly.iloc[-test_months:].copy()
 
 
 def lgb_train(train_df: pd.DataFrame) -> lgb.LGBMRegressor:
@@ -73,6 +79,9 @@ def lgb_forecast_recursive(model: lgb.LGBMRegressor, known_y: list, future_ds: l
 
 
 # ── 백테스트 (검증 구간 MAPE 계산) ──────────────────────────────
+naive_pred = [float(train["y"].iloc[-1])] * len(test)
+naive_mape = mean_absolute_percentage_error(test["y"], naive_pred) * 100
+
 sarima_fit = SARIMAX(train["y"], order=(1, 1, 1), seasonal_order=(0, 0, 0, 0)).fit(disp=False)
 sarima_pred = sarima_fit.forecast(steps=len(test))
 sarima_mape = mean_absolute_percentage_error(test["y"], sarima_pred) * 100
@@ -94,6 +103,15 @@ models = {
     "LightGBM": {"mape": round(float(lgb_mape), 2), "predictions": [round(float(v)) for v in lgb_pred]},
 }
 best_model = min(models, key=lambda k: models[k]["mape"])
+baseline = {
+    "name": "Naive Last Value",
+    "mape": round(float(naive_mape), 2),
+    "predictions": [round(float(v)) for v in naive_pred],
+}
+baseline_improvement = {
+    "absolute_mape_point": round(float(naive_mape - models[best_model]["mape"]), 2),
+    "relative_percent": round(float((naive_mape - models[best_model]["mape"]) / naive_mape * 100), 2),
+}
 
 
 # ── 미래 예측 (전체 데이터로 재학습, 백테스트와 완전히 분리) ──────────
@@ -117,40 +135,6 @@ future_predictions = {
     "Prophet": [round(float(v)) for v in prophet_future],
     "LightGBM": [round(float(v)) for v in lgb_future],
 }
-
-
-def compute_trend(series: pd.Series, window: int = 6) -> tuple:
-    """LLM에게 추세 판단을 맡기지 않고, 최근 window개월의 선형회귀 기울기로
-    서버에서 먼저 추세를 확정한다. LLM은 이 판단을 문장으로 풀어쓰기만 한다."""
-    n = min(window, len(series))
-    y = series.tail(n).to_numpy(dtype=float)
-    x = np.arange(n, dtype=float)
-    slope = float(np.polyfit(x, y, 1)[0])
-    mean = float(y.mean()) if y.mean() else 1.0
-    rel_slope = slope / mean
-    if rel_slope > 0.03:
-        label = "상승"
-    elif rel_slope < -0.03:
-        label = "하락"
-    else:
-        label = "혼조/보합"
-    return label, slope, n
-
-
-def verify_trend_consistency(text: str, trend_label: str) -> bool:
-    """LLM 응답이 서버가 계산한 추세와 모순되는 단어를 쓰지 않았는지 확인한다.
-    (작은 로컬 모델은 계산은 못 시키더라도 서술 자체가 틀릴 수 있어 사후 검증한다.)"""
-    if not text:
-        return False
-    up_words = ["상승", "증가", "늘어", "오름세", "증가세"]
-    down_words = ["하락", "감소", "줄어", "내림세", "감소세"]
-    has_up = any(w in text for w in up_words)
-    has_down = any(w in text for w in down_words)
-    if trend_label == "상승":
-        return not (has_down and not has_up)
-    if trend_label == "하락":
-        return not (has_up and not has_down)
-    return True  # 혼조/보합은 어느 쪽 표현이 섞여도 허용
 
 
 def generate_ai_judgment(monthly, train, test, models, best_model, trend_label, trend_slope, trend_window):
@@ -179,7 +163,7 @@ def generate_ai_judgment(monthly, train, test, models, best_model, trend_label, 
         f"최근 {trend_window}개월 선형회귀 기울기 기준 추세: {trend_label} "
         f"(월평균 {trend_slope:+.1f}건 변화) — 이 판단을 그대로 사용하세요.\n\n"
         f"위 데이터만 근거로: (1) 추세가 왜 '{trend_label}'인지 [확정된 추세 판단]을 그대로 설명하고, "
-        f"(2) {best_model}이 왜 검증 구간을 가장 잘 재현했는지, (3) 데이터가 11개월뿐이라 "
+        f"(2) {best_model}이 왜 검증 구간을 가장 잘 재현했는지, (3) 데이터가 {len(monthly)}개월뿐이라 "
         "계절성 판단에 한계가 있다는 점을 반드시 포함해 짧게 답변하세요. "
         "반드시 한국어로만 답변하세요."
     )
@@ -211,7 +195,7 @@ ai_judgment_raw = generate_ai_judgment(
 if ai_judgment_raw is None:
     ai_judgment = None
     ai_judgment_status = "failed_generation"
-elif not verify_trend_consistency(ai_judgment_raw, trend_label):
+elif not verify_trend_consistency(ai_judgment_raw, trend_label, trend_slope):
     print(f"[WARNING] AI 판단 결과가 계산된 추세({trend_label})와 모순되어 폐기합니다.")
     ai_judgment = None
     ai_judgment_status = "failed_verification"
@@ -230,6 +214,8 @@ result = {
     "test_actual": [int(v) for v in test["y"]],
     "models": models,
     "best_model": best_model,
+    "baseline": baseline,
+    "baseline_improvement": baseline_improvement,
     "forecast_horizon": FUTURE_HORIZON,
     "future_predictions": future_predictions,
     "trend_label": trend_label,

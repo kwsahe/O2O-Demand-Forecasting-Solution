@@ -1,7 +1,9 @@
 # 실행: venv 활성화 후 `python app.py` (http://localhost:8300)
 from flask import Flask, jsonify, request, render_template
 from dotenv import load_dotenv
+from functools import lru_cache
 import pandas as pd
+import numpy as np
 import os
 import sys
 import json
@@ -20,8 +22,9 @@ from src.collector import (
     GYEONGGI_SIGUNGU_CODES,
     METRO5_SIGUNGU_CODES,
     ALL_SIGUNGU_CODES,
+    SIGUNGU_CODE_TO_FULL_NAME,
 )
-from src.pipeline import DemandForecastingPipeline
+from src.pipeline import DemandForecastingPipeline, extract_sido
 
 app = Flask(__name__)
 
@@ -29,6 +32,8 @@ API_KEY = os.getenv("API_KEY", "")
 APT_BASIC_INFO_API_KEY = os.getenv("APT_BASIC_INFO_API_KEY", "")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "qwen2.5:3b")
+CHAT_TIMEOUT = int(os.getenv("CHAT_TIMEOUT", "60"))
+CHAT_MAX_MESSAGE = int(os.getenv("CHAT_MAX_MESSAGE", "500"))
 # /api/collect(전국 재수집) 보호용 관리자 토큰. 비워두면(로컬 개발) 인증 없이 허용.
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
 
@@ -46,26 +51,33 @@ def _atomic_write_csv(df: pd.DataFrame, path: str) -> None:
     os.replace(tmp_path, path)
 
 
-def _upsert_raw(existing_path: str, df_new: pd.DataFrame) -> pd.DataFrame:
+def _upsert_raw(existing_path: str, df_new: pd.DataFrame, replace_keys=None) -> pd.DataFrame:
     """새로 수집한 (수집_시군구코드, 수집_연월) 조합의 기존 행만 제거하고 새 데이터로
     교체한다. 나머지 지역·기간 데이터는 그대로 유지되므로 부분 수집이 전국 결과를
-    덮어쓰지 않는다."""
-    if df_new is None or df_new.empty:
+    덮어쓰지 않는다. replace_keys를 주면 신규 0건인 조합도 기존 행을 제거한다."""
+    if (df_new is None or df_new.empty) and not replace_keys:
         if os.path.exists(existing_path):
             return pd.read_csv(existing_path, encoding="utf-8-sig", low_memory=False)
         return pd.DataFrame()
 
+    if df_new is None:
+        df_new = pd.DataFrame()
     if not os.path.exists(existing_path):
-        return df_new
+        return df_new.copy()
 
     df_existing = pd.read_csv(existing_path, encoding="utf-8-sig", low_memory=False)
-    new_keys = set(
-        df_new["수집_시군구코드"].astype(str) + "|" + df_new["수집_연월"].astype(str)
-    )
+    if replace_keys is not None:
+        new_keys = {f"{code}|{ym}" for code, ym in replace_keys}
+    else:
+        new_keys = set(
+            df_new["수집_시군구코드"].astype(str) + "|" + df_new["수집_연월"].astype(str)
+        )
     existing_keys = (
         df_existing["수집_시군구코드"].astype(str) + "|" + df_existing["수집_연월"].astype(str)
     )
     df_existing = df_existing[~existing_keys.isin(new_keys)]
+    if df_new.empty:
+        return df_existing.reset_index(drop=True)
     return pd.concat([df_existing, df_new], ignore_index=True)
 NAVER_MAP_CLIENT_ID = os.getenv("NAVER_MAP_CLIENT_ID", "")
 
@@ -127,6 +139,11 @@ def guide():
 @app.route("/forecast")
 def forecast():
     return render_template("forecast.html")
+
+
+@app.route("/region")
+def region():
+    return render_template("region.html")
 
 
 @app.route("/health")
@@ -206,6 +223,272 @@ def get_sido_summary():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
+
+REGION_METRICS = [
+    ("거래건수", "매매 거래", "건"),
+    ("평균거래금액_만원", "평균 거래금액", "만원"),
+    ("전월세거래건수", "전월세 거래", "건"),
+    ("평균노후도_년", "평균 노후도", "년"),
+    ("평균면적_m2", "평균 면적", "㎡"),
+    ("신규입주_세대수", "신규 입주", "세대"),
+    ("대수선이력건수", "대수선 이력", "건"),
+]
+
+
+def _region_key(sido: str, sigungu: str) -> str:
+    return f"{sido}|{sigungu}"
+
+
+def _region_codes(sido: str, sigungu: str) -> list[str]:
+    return sorted(
+        code
+        for code, full_name in SIGUNGU_CODE_TO_FULL_NAME.items()
+        if extract_sido(full_name) == sido
+        and len(full_name.split()) >= 2
+        and full_name.split()[1] == sigungu
+    )
+
+
+def _records(df: pd.DataFrame) -> list:
+    if df.empty:
+        return []
+    return json.loads(df.to_json(orient="records", force_ascii=False))
+
+
+@lru_cache(maxsize=1)
+def _load_region_sources(trade_mtime: float, rent_mtime: float):
+    trade_columns = [
+        "aptNm", "buildYear", "dealAmount", "dealDay", "dealMonth", "dealYear",
+        "excluUseAr", "floor", "umdNm", "수집_시군구코드", "수집_연월",
+    ]
+    rent_columns = [
+        "aptNm", "buildYear", "dealMonth", "dealYear", "deposit", "excluUseAr",
+        "monthlyRent", "umdNm", "수집_시군구코드", "수집_연월",
+    ]
+    trade = pd.read_csv(
+        RAW_TRADE_PATH,
+        encoding="utf-8-sig",
+        usecols=trade_columns,
+        dtype={"수집_시군구코드": str, "수집_연월": str},
+        low_memory=False,
+    )
+    rent = pd.read_csv(
+        RAW_RENT_PATH,
+        encoding="utf-8-sig",
+        usecols=rent_columns,
+        dtype={"수집_시군구코드": str, "수집_연월": str},
+        low_memory=False,
+    )
+    return trade, rent
+
+
+def _get_region_sources():
+    return _load_region_sources(
+        os.path.getmtime(RAW_TRADE_PATH),
+        os.path.getmtime(RAW_RENT_PATH),
+    )
+
+
+def _region_catalog() -> pd.DataFrame:
+    df = pd.read_csv(RESULT_PATH, encoding="utf-8-sig")
+    df["key"] = df.apply(lambda row: _region_key(row["시도"], row["시군구"]), axis=1)
+    df["name"] = df["시도"] + " " + df["시군구"]
+    df["codes"] = df.apply(lambda row: _region_codes(row["시도"], row["시군구"]), axis=1)
+    return df
+
+
+@app.route("/api/regions", methods=["GET"])
+def get_regions():
+    try:
+        query = request.args.get("q", "").strip()
+        if len(query) > 50:
+            return jsonify({"status": "error", "message": "검색어가 너무 깁니다."}), 400
+
+        catalog = _region_catalog().sort_values("인테리어_수요점수", ascending=False)
+        if query:
+            normalized = query.replace(" ", "").lower()
+            mask = catalog["name"].str.replace(" ", "", regex=False).str.lower().str.contains(
+                normalized, regex=False
+            )
+            catalog = catalog[mask]
+
+        data = catalog.head(12)[["key", "name", "시도", "시군구", "인테리어_수요점수", "codes"]]
+        return jsonify({"status": "ok", "count": len(data), "data": _records(data)})
+    except FileNotFoundError:
+        return jsonify({"status": "error", "message": "지역 분석 결과 파일이 없습니다."}), 404
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+def _build_region_analysis(summary: dict, metrics: list[dict]) -> dict:
+    score = float(summary["인테리어_수요점수"])
+    if score >= 60:
+        recommendation = "최우선 진입"
+        recommendation_detail = "전면 리모델링과 입주 인테리어 영업을 함께 집중할 지역입니다."
+    elif score >= 30:
+        recommendation = "선별 진입"
+        recommendation_detail = "수요가 강한 동·단지와 상품군을 선별해 접근하는 것이 적합합니다."
+    else:
+        recommendation = "관찰 지역"
+        recommendation_detail = "대규모 집행보다 단지 단위 테스트와 변화 추적이 적합합니다."
+
+    strongest = sorted(metrics, key=lambda item: item["percentile"], reverse=True)[:3]
+    weakest = sorted(metrics, key=lambda item: item["percentile"])[:2]
+    return {
+        "recommendation": recommendation,
+        "detail": recommendation_detail,
+        "strengths": [
+            f"{item['label']} 지표가 전체 분석 지역의 상위 {max(1, 101 - round(item['percentile']))}% 수준입니다."
+            for item in strongest
+        ],
+        "risks": [
+            f"{item['label']} 지표는 전체 분석 지역 중 {round(item['percentile'])}백분위로 상대적으로 낮습니다."
+            for item in weakest
+        ],
+    }
+
+
+@app.route("/api/region", methods=["GET"])
+def get_region_detail():
+    try:
+        key = request.args.get("key", "").strip()
+        if not key or len(key) > 50 or "|" not in key:
+            return jsonify({"status": "error", "message": "목록에서 정확한 지역을 선택하세요."}), 400
+
+        catalog = _region_catalog()
+        matched = catalog[catalog["key"] == key]
+        if matched.empty:
+            return jsonify({"status": "error", "message": "분석 대상 지역을 찾을 수 없습니다."}), 404
+
+        row = matched.iloc[0]
+        sido, sigungu = row["시도"], row["시군구"]
+        codes = [str(code) for code in row["codes"]]
+        ranked = catalog.sort_values("인테리어_수요점수", ascending=False).reset_index(drop=True)
+        ranked["overall_rank"] = ranked.index + 1
+        sido_ranked = ranked[ranked["시도"] == sido].reset_index(drop=True)
+        sido_rank = int(sido_ranked.index[sido_ranked["key"] == key][0]) + 1
+        overall_rank = int(ranked.loc[ranked["key"] == key, "overall_rank"].iloc[0])
+
+        metrics = []
+        for column, label, unit in REGION_METRICS:
+            values = pd.to_numeric(catalog[column], errors="coerce")
+            value = float(row[column])
+            metrics.append({
+                "key": column,
+                "label": label,
+                "unit": unit,
+                "value": value,
+                "national_average": round(float(values.mean()), 1),
+                "sido_average": round(float(pd.to_numeric(catalog[catalog["시도"] == sido][column], errors="coerce").mean()), 1),
+                "percentile": round(float(values.rank(pct=True).loc[row.name] * 100), 1),
+            })
+
+        trade_all, rent_all = _get_region_sources()
+        trade = trade_all[trade_all["수집_시군구코드"].isin(codes)].copy()
+        rent = rent_all[rent_all["수집_시군구코드"].isin(codes)].copy()
+        trade["거래금액_만원"] = pd.to_numeric(
+            trade["dealAmount"].astype(str).str.replace(",", "", regex=False), errors="coerce"
+        )
+        trade["전용면적"] = pd.to_numeric(trade["excluUseAr"], errors="coerce")
+        trade["건축년도"] = pd.to_numeric(trade["buildYear"], errors="coerce")
+        trade["계약년도"] = pd.to_numeric(trade["dealYear"], errors="coerce")
+        rent["보증금_만원"] = pd.to_numeric(
+            rent["deposit"].astype(str).str.replace(",", "", regex=False), errors="coerce"
+        )
+        rent["월세_만원"] = pd.to_numeric(rent["monthlyRent"], errors="coerce")
+
+        month_index = sorted(set(trade["수집_연월"].dropna()) | set(rent["수집_연월"].dropna()))
+        trade_monthly = trade.groupby("수집_연월").agg(
+            trade_count=("aptNm", "size"),
+            average_price=("거래금액_만원", "mean"),
+        )
+        rent_monthly = rent.groupby("수집_연월").size().rename("rent_count")
+        trend = pd.DataFrame(index=month_index).join(trade_monthly).join(rent_monthly).fillna({
+            "trade_count": 0, "rent_count": 0,
+        })
+        trend.index.name = "ym"
+        trend = trend.reset_index()
+        trend["average_price"] = trend["average_price"].round(1)
+
+        age = trade["계약년도"] - trade["건축년도"]
+        segment = pd.cut(
+            age,
+            bins=[-np.inf, 5, 14, 20, np.inf],
+            labels=["New", "Mid", "Old", "Very Old"],
+        )
+        segment_counts = segment.value_counts(sort=False)
+        segment_df = segment_counts.rename_axis("segment").reset_index(name="count")
+        segment_df["percentage"] = (segment_df["count"] / max(1, segment_df["count"].sum()) * 100).round(1)
+
+        apartments = trade.groupby(["aptNm", "umdNm"], dropna=False).agg(
+            trade_count=("aptNm", "size"),
+            average_price=("거래금액_만원", "mean"),
+            average_area=("전용면적", "mean"),
+            build_year=("건축년도", "median"),
+            latest_ym=("수집_연월", "max"),
+        ).reset_index().sort_values("trade_count", ascending=False).head(10)
+        apartments.columns = [
+            "apartment", "dong", "trade_count", "average_price", "average_area", "build_year", "latest_ym",
+        ]
+        for column in ["average_price", "average_area", "build_year"]:
+            apartments[column] = apartments[column].round(1)
+
+        recent = trade.sort_values(
+            ["dealYear", "dealMonth", "dealDay"], ascending=False
+        ).head(15)[[
+            "aptNm", "umdNm", "dealYear", "dealMonth", "dealDay", "거래금액_만원", "전용면적", "floor", "건축년도",
+        ]].copy()
+        recent.columns = [
+            "apartment", "dong", "year", "month", "day", "price", "area", "floor", "build_year",
+        ]
+
+        comparison_columns = [item[0] for item in REGION_METRICS]
+        comparison_values = catalog[comparison_columns].apply(pd.to_numeric, errors="coerce")
+        standardized = (comparison_values - comparison_values.mean()) / comparison_values.std().replace(0, 1)
+        distances = ((standardized - standardized.loc[row.name]) ** 2).mean(axis=1).pow(0.5)
+        similar = catalog.assign(_distance=distances)
+        similar = similar[similar["key"] != key].sort_values(
+            ["_distance", "인테리어_수요점수"], ascending=[True, False]
+        ).head(5)[["key", "name", "인테리어_수요점수", "거래건수", "전월세거래건수", "_distance"]]
+        similar = similar.rename(columns={"_distance": "distance"})
+        similar["distance"] = similar["distance"].round(2)
+
+        summary = json.loads(row.drop(labels=["codes"]).to_json(force_ascii=False))
+        summary.update({
+            "codes": codes,
+            "overall_rank": overall_rank,
+            "overall_total": len(catalog),
+            "sido_rank": sido_rank,
+            "sido_total": int((catalog["시도"] == sido).sum()),
+        })
+        coverage = {
+            "start_ym": month_index[0] if month_index else None,
+            "end_ym": month_index[-1] if month_index else None,
+            "trade_rows": len(trade),
+            "rent_rows": len(rent),
+            "source_codes": codes,
+            "updated_at": datetime.fromtimestamp(max(
+                os.path.getmtime(RAW_TRADE_PATH), os.path.getmtime(RAW_RENT_PATH)
+            )).isoformat(timespec="minutes"),
+        }
+
+        return jsonify({
+            "status": "ok",
+            "summary": summary,
+            "metrics": metrics,
+            "trend": _records(trend),
+            "segments": _records(segment_df),
+            "apartments": _records(apartments),
+            "recent_transactions": _records(recent),
+            "similar_regions": _records(similar),
+            "analysis": _build_region_analysis(summary, metrics),
+            "coverage": coverage,
+        })
+    except FileNotFoundError:
+        return jsonify({"status": "error", "message": "지역 분석에 필요한 데이터 파일이 없습니다."}), 404
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 @app.route("/api/collect", methods=["POST"])
 def collect():
     try:
@@ -226,7 +509,7 @@ def collect():
             if not codes:
                 return jsonify({"status": "error", "message": f"알 수 없는 시군구 코드: {sigungu_code}"}), 400
         else:
-            # 기본값: 서울/인천/경기/5대 광역시 전체(102개 시군구) — 특정 지역으로
+            # 기본값: 서울/인천/경기/5대 광역시 지원 행정구역 전체 — 특정 지역으로
             # 좁혀서 전국 결과를 덮어쓰는 사고를 방지한다.
             codes = ALL_SIGUNGU_CODES
 
@@ -236,10 +519,23 @@ def collect():
             return jsonify({"status": "error", "message": "수집된 매매 데이터가 없습니다. API 키/지역 코드를 확인하세요."}), 502
 
         df_rent_raw_new = collector.fetch_recent_months_rent(sigungu_codes=codes, months=months, save_path=None)
+        if df_rent_raw_new.empty or not df_rent_raw_new.attrs.get("fetch_ok", True):
+            return jsonify({"status": "error", "message": "전월세 데이터 수집이 불완전하여 저장하지 않았습니다."}), 502
 
-        # 기존 전국 원본과 upsert — 재수집한 (시군구, 연월)만 교체되고 나머지 지역은 유지된다.
-        df_trade_all = _upsert_raw(RAW_TRADE_PATH, df_raw_new)
-        df_rent_all = _upsert_raw(RAW_RENT_PATH, df_rent_raw_new)
+        end_period = pd.Period(pd.Timestamp.today(), freq="M")
+        requested_months = [
+            (end_period - offset).strftime("%Y%m")
+            for offset in range(months)
+        ]
+        requested_keys = {
+            (str(code), ym)
+            for code in codes.values()
+            for ym in requested_months
+        }
+
+        # 신규 0건인 지역·월도 기존 행을 제거해야 오래된 데이터가 남지 않는다.
+        df_trade_all = _upsert_raw(RAW_TRADE_PATH, df_raw_new, requested_keys)
+        df_rent_all = _upsert_raw(RAW_RENT_PATH, df_rent_raw_new, requested_keys)
 
         # 파이프라인은 항상 전국 데이터로 재실행하므로, 부분 수집이어도 최종 결과는 전국 범위를 유지한다.
         pipeline = DemandForecastingPipeline(
@@ -395,22 +691,56 @@ def find_region_context(message: str, df: pd.DataFrame, sido_summary: pd.DataFra
     sigungu_mask = pd.Series(False, index=df.index)
     sido_mask = pd.Series(False, index=sido_summary.index)
     for token in tokens:
-        sigungu_mask |= df["시군구"].str.contains(token, na=False)
-        sido_mask |= sido_summary["시도"].str.contains(token, na=False)
+        sigungu_mask |= df["시군구"].str.contains(token, na=False, regex=False)
+        sido_mask |= sido_summary["시도"].str.contains(token, na=False, regex=False)
 
     parts = []
-    matched_sigungu = df[sigungu_mask]
+    matched_sigungu = df[sigungu_mask].copy()
     if not matched_sigungu.empty:
+        score = pd.to_numeric(df["인테리어_수요점수"], errors="coerce")
+        matched_sigungu["전국순위"] = score.rank(ascending=False, method="min").loc[matched_sigungu.index].astype(int)
+        matched_sigungu["시도내순위"] = (
+            df.groupby("시도")["인테리어_수요점수"].rank(ascending=False, method="min")
+            .loc[matched_sigungu.index].astype(int)
+        )
+        matched_sigungu["시도지역수"] = matched_sigungu["시도"].map(df.groupby("시도").size())
+        matched_sigungu["등급"] = pd.cut(
+            pd.to_numeric(matched_sigungu["인테리어_수요점수"], errors="coerce"),
+            bins=[-np.inf, 30, 60, np.inf], labels=["B", "A", "S"], right=False,
+        ).astype(str)
+        for column, label, _ in REGION_METRICS:
+            percentile = pd.to_numeric(df[column], errors="coerce").rank(pct=True) * 100
+            matched_sigungu[f"{label}_전국백분위"] = percentile.loc[matched_sigungu.index].round(1)
+        region_lines = []
+        for _, row in matched_sigungu.iterrows():
+            region_lines.extend([
+                f"지역={row['시도']} {row['시군구']} | 수요점수={float(row['인테리어_수요점수']):.1f}점 | "
+                f"등급={row['등급']} | 전국순위={int(row['전국순위'])}위/{len(df)}개 | "
+                f"시도내순위={int(row['시도내순위'])}위/{int(row['시도지역수'])}개",
+                f"핵심지표: 매매 거래={int(row['거래건수']):,}건 | 평균 거래금액={float(row['평균거래금액_만원']):,.1f}만원 | "
+                f"전월세 거래={int(row['전월세거래건수']):,}건 | 평균 노후도={float(row['평균노후도_년']):.1f}년 | "
+                f"평균 면적={float(row['평균면적_m2']):.1f}㎡ | 신규 입주={int(row['신규입주_세대수']):,}세대 | "
+                f"대수선 이력={int(row['대수선이력건수']):,}건 | 추정 시장규모={float(row['시장규모_추정_억']):,.1f}억원",
+                "전국백분위: " + " | ".join(
+                    f"{label}={float(row[f'{label}_전국백분위']):.1f}"
+                    for _, label, _ in REGION_METRICS
+                ),
+                f"필수 사실: {row['시군구']} 수요점수는 {float(row['인테리어_수요점수']):.1f}점이며 "
+                f"전국 {int(row['전국순위'])}위, {row['시도']} 내 {int(row['시도내순위'])}위입니다.",
+            ])
         parts.append(
-            "[질문에 언급된 시군구의 정확한 데이터 — 시군구 단위 질문에는 반드시 이 표의 값을 사용하세요]\n"
-            + matched_sigungu.to_csv(index=False)
+            "[질문에 언급된 시군구의 정확한 데이터 — 순위·등급·백분위를 그대로 사용하고 새 원인을 추론하지 마세요]\n"
+            + "\n".join(region_lines)
         )
 
     matched_sido = sido_summary[sido_mask]
     if not matched_sido.empty:
+        sido_lines = []
+        for _, row in matched_sido.iterrows():
+            sido_lines.append(" | ".join(f"{column}={row[column]}" for column in matched_sido.columns))
         parts.append(
             "[질문에 언급된 시/도의 전체 요약 데이터 — 시/도 전체 합계·평균값이며, 개별 시군구의 값이 아닙니다]\n"
-            + matched_sido.to_csv(index=False)
+            + "\n".join(sido_lines)
         )
 
     if not parts:
@@ -441,6 +771,185 @@ def build_ranking_summary(df: pd.DataFrame, top_n: int = 10) -> str:
     return "\n".join(lines)
 
 
+DEMAND_CHAT_SYSTEM_PROMPT = """당신은 오늘의집 O2O 인테리어 수요 분석 도우미입니다.
+반드시 한국어로만, 결론부터 간결하게 답하세요.
+
+규칙:
+1. [근거 데이터]에 있는 수치만 사용하고 없는 사실은 추측하지 마세요.
+2. 계산, 순위 결정, 단위 변환을 새로 하지 마세요. 코드가 제공한 결과를 그대로 설명하세요.
+3. 시도 전체 합계와 시군구 개별값을 혼동하지 마세요.
+4. 지역의 주거 특성, 주민 성향, 상권 등 제공되지 않은 배경 원인을 상식으로 덧붙이지 마세요.
+5. '가장 높다', '1위'는 근거 데이터의 순위가 실제 1일 때만 사용하세요.
+6. 답변은 보통 3~6문장으로 작성하고, 핵심 수치 2~4개를 포함하세요.
+7. 데이터가 없으면 '현재 데이터에서 확인할 수 없습니다'라고 명확히 답하세요.
+8. 이모지, 과도한 인사, 같은 결론의 반복은 사용하지 마세요.
+
+수요 점수는 0~100점이며 매매 거래 20%, 평균 거래금액 15%, 평균 노후도 15%, 평균 면적 10%,
+신규 입주 10%, 전월세 거래 20%, 대수선 이력 10%를 정규화해 합산합니다.
+등급은 S 60점 이상, A 30~59.9점, B 30점 미만입니다.
+거래건수와 전월세거래건수는 15~20년 아파트 표본이며, 시장규모와 예상시공비는 추정치입니다."""
+
+
+GUIDE_CHAT_SYSTEM_PROMPT = """당신은 생애 첫 주택 구매자를 돕는 한국어 가이드입니다.
+결론부터 쉽고 차분하게 답하고, 절차 질문은 3~7개의 번호 목록으로 정리하세요.
+사용자가 알려준 예산·지역·소득 조건만 사용하며 모르는 조건을 지어내지 마세요.
+금리, 세율, LTV·DSR, 정책대출 자격처럼 바뀔 수 있는 값은 단정하지 말고 기준일과 공식 확인 필요성을 알리세요.
+법률·세무·대출의 최종 판단은 은행, 법무사, 세무사 등 전문가 확인이 필요하다고 안내하세요.
+과도한 인사와 이모지는 사용하지 말고 답변은 700자 안팎으로 제한하세요.
+
+표준 흐름: 자금 계획 → 매물·실거래 확인 → 등기부·건축물대장 확인 → 계약 및 특약 → 대출 실행 준비
+→ 잔금과 소유권 이전 → 취득세·전입·보험 등 사후 절차."""
+
+
+def build_demand_context(message: str, df: pd.DataFrame, sido_summary: pd.DataFrame) -> str:
+    """3B 모델에 전체 표 대신 질문에 필요한 결정론적 검색 결과만 제공한다."""
+    score = pd.to_numeric(df["인테리어_수요점수"], errors="coerce")
+    parts = [
+        "[근거 데이터: 전체 요약]",
+        f"분석 지역 수: {len(df)}개",
+        f"수요 점수 평균: {score.mean():.1f}점",
+        f"데이터 기준: 2025-07~2026-06",
+    ]
+
+    ranking_words = ("순위", "상위", "하위", "최고", "최저", "가장", "추천", "어디")
+    if any(word in message for word in ranking_words):
+        parts.extend(["", build_ranking_summary(df)])
+
+    region_context = find_region_context(message, df, sido_summary).strip()
+    if region_context:
+        parts.extend(["", region_context])
+
+    apartment_context = find_apartment_context(message).strip()
+    if apartment_context:
+        parts.extend(["", apartment_context])
+
+    if not region_context and not apartment_context and not any(word in message for word in ranking_words):
+        parts.extend([
+            "",
+            "질문에서 특정 지역이나 단지를 찾지 못했습니다. 일반적인 점수 산식 설명만 가능하며 지역 수치는 답하지 마세요.",
+        ])
+    return "\n".join(parts)
+
+
+def _clean_llm_answer(answer: str) -> str:
+    """사고 태그와 불필요한 공백을 제거하고 비정상 응답을 거부한다."""
+    import re
+
+    answer = re.sub(r"<think>.*?</think>", "", answer or "", flags=re.DOTALL | re.IGNORECASE)
+    answer = re.sub(r"\n{3,}", "\n\n", answer).strip()
+    if not answer:
+        raise ValueError("AI가 빈 답변을 반환했습니다.")
+    return answer[:4000]
+
+
+def _audit_demand_answer(answer: str) -> str:
+    """데이터에 없는 지역 이미지를 원인으로 붙인 문장을 최종 응답에서 제외한다."""
+    import re
+
+    unsupported_phrases = (
+        "고급 주거지", "상권 활성", "상업 시설", "시설 밀집", "주민 성향",
+        "투자 성향", "부유층", "소득 수준", "알려져 있", "잠재적 성장",
+        "고객 만족도", "신뢰성을 높",
+    )
+    sentences = re.split(r"(?<=[.!?。])\s+", answer.strip())
+    grounded = [
+        sentence for sentence in sentences
+        if sentence and not any(phrase in sentence for phrase in unsupported_phrases)
+    ]
+    return " ".join(grounded).strip() or "제공된 데이터만으로는 해당 질문에 답하기 어렵습니다."
+
+
+def _ollama_chat(messages: list[dict], num_ctx: int = 4096, num_predict: int = 512) -> str:
+    """Qwen 3B에 맞춘 공통 Ollama 호출 경로."""
+    res = requests.post(
+        f"{OLLAMA_HOST}/api/chat",
+        json={
+            "model": CHAT_MODEL,
+            "messages": messages,
+            "stream": False,
+            "keep_alive": "30m",
+            "options": {
+                "num_ctx": num_ctx,
+                "num_predict": num_predict,
+                "temperature": 0.15,
+                "top_p": 0.85,
+                "repeat_penalty": 1.12,
+                "seed": 42,
+            },
+        },
+        timeout=CHAT_TIMEOUT,
+    )
+    res.raise_for_status()
+    return _clean_llm_answer(res.json().get("message", {}).get("content", ""))
+
+
+@app.route("/api/region-insight", methods=["POST"])
+def region_insight():
+    """선택 지역의 확정 지표만 사용해 Qwen이 짧은 실행 해설을 생성한다."""
+    key = ""
+    try:
+        body = request.get_json() or {}
+        key = str(body.get("key", "")).strip()
+        if not key or "|" not in key or len(key) > 50:
+            return jsonify({"status": "error", "message": "정확한 지역을 먼저 선택하세요."}), 400
+
+        catalog = _region_catalog()
+        matched = catalog[catalog["key"] == key]
+        if matched.empty:
+            return jsonify({"status": "error", "message": "분석 대상 지역을 찾을 수 없습니다."}), 404
+
+        row = matched.iloc[0]
+        ranked = catalog.sort_values("인테리어_수요점수", ascending=False).reset_index(drop=True)
+        overall_rank = int(ranked.index[ranked["key"] == key][0]) + 1
+        summary = row.to_dict()
+        metrics = []
+        for column, label, unit in REGION_METRICS:
+            values = pd.to_numeric(catalog[column], errors="coerce")
+            percentile = float(values.rank(pct=True).loc[row.name] * 100)
+            metrics.append({"label": label, "value": float(row[column]), "unit": unit, "percentile": percentile})
+        decision = _build_region_analysis(summary, metrics)
+        grade = "S" if float(row["인테리어_수요점수"]) >= 60 else "A" if float(row["인테리어_수요점수"]) >= 30 else "B"
+
+        evidence = "\n".join(
+            f"- {item['label']}: {item['value']:,.1f}{item['unit']} / 전국 {item['percentile']:.0f}백분위"
+            for item in metrics
+        )
+        prompt = f"""[확정된 지역 데이터]
+지역: {row['name']}
+수요 점수: {float(row['인테리어_수요점수']):.1f}점
+확정 등급: {grade}등급
+전국 순위: {overall_rank}위 / {len(catalog)}개
+코드 기반 진입 판단: {decision['recommendation']}
+추정 시장규모: {float(row['시장규모_추정_억']):,.1f}억원
+{evidence}
+확정 강점: {' / '.join(decision['strengths'])}
+유의 지표: {' / '.join(decision['risks'])}
+
+위 수치만 사용해 이 지역의 인테리어 사업 관점 해설을 작성하세요.
+첫 문장은 반드시 '{row['name']}은 {decision['recommendation']} 지역입니다.'로 시작하세요.
+이후 '근거' 2개와 '실행 제안' 2개를 작성하며 총 7문장 이내입니다.
+새 숫자를 계산하거나 등급·순위·진입 판단을 바꾸지 마세요. 제공되지 않은 지역 특성은 언급하지 마세요."""
+        answer = _audit_demand_answer(_ollama_chat(
+            [
+                {"role": "system", "content": DEMAND_CHAT_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            num_ctx=3072,
+            num_predict=420,
+        ))
+        save_chat_log(f"[지역 AI 해설] {row['name']}", answer, "ok", chat_type="region")
+        return jsonify({"status": "ok", "insight": answer, "model": CHAT_MODEL})
+    except requests.exceptions.ConnectionError:
+        save_chat_log(f"[지역 AI 해설] {key}", None, "error: ollama_connection", chat_type="region")
+        return jsonify({"status": "error", "message": "로컬 AI 서버에 연결할 수 없습니다."}), 503
+    except requests.exceptions.Timeout:
+        save_chat_log(f"[지역 AI 해설] {key}", None, "error: ollama_timeout", chat_type="region")
+        return jsonify({"status": "error", "message": "AI 응답 시간이 초과되었습니다."}), 504
+    except Exception as e:
+        save_chat_log(f"[지역 AI 해설] {key}", None, f"error: {e}", chat_type="region")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 @app.route("/api/chat", methods=["POST"])
 def chat():
     message = ""
@@ -450,6 +959,8 @@ def chat():
 
         if not message:
             return jsonify({"status": "error", "message": "메시지를 입력하세요."}), 400
+        if len(message) > CHAT_MAX_MESSAGE:
+            return jsonify({"status": "error", "message": f"질문은 {CHAT_MAX_MESSAGE}자 이내로 입력하세요."}), 400
 
         df = pd.read_csv("data/인테리어_수요점수_결과.csv", encoding="utf-8-sig")
         df = df.sort_values("인테리어_수요점수", ascending=False)
@@ -552,41 +1063,25 @@ def chat():
             "반드시 한국어로만 답변하세요. 다른 언어(영어, 중국어, 일본어 등)는 절대 사용하지 마세요."
         )
 
-        # 실제 수치 데이터는 별도 system 메시지로 분리해 대화 맨 끝(사용자 질문 바로 앞)에 배치한다.
-        # 시스템 프롬프트 안에 모든 데이터를 다 넣으면 작은 모델이 앞부분 내용을
-        # 잘 활용하지 못해 순위/지역 데이터를 잘못 읽는 문제가 있었음.
-        data_context = (
-            f"{build_ranking_summary(df)}\n\n"
-            "[전체 시군구별 인테리어 수요 점수 (수요 점수 높은 순)]\n"
-            f"{df.to_csv(index=False)}\n"
-            "[시도별 요약]\n"
-            f"{sido_summary.to_csv(index=False)}"
-            f"{find_region_context(message, df, sido_summary)}"
-            f"{find_apartment_context(message)}"
-        )
+        # 3B 모델에는 전체 CSV 대신 질문과 관련된 행과 사전 계산 순위만 전달한다.
+        system_prompt = DEMAND_CHAT_SYSTEM_PROMPT
+        data_context = build_demand_context(message, df, sido_summary)
 
+        grounded_question = (
+            f"{data_context}\n\n"
+            f"[사용자 질문]\n{message}\n\n"
+            "[답변 직전 검수]\n"
+            "- 점수·등급·전국순위·시도순위는 위 근거와 한 글자도 다르게 쓰지 마세요.\n"
+            "- 높은/낮은 이유는 위 전국백분위 지표만 사용하세요.\n"
+            "- 고급 주거지, 상권, 주민 성향, 투자 성향, 시설 밀집처럼 근거에 없는 설명은 금지합니다.\n"
+            "- 근거 데이터에 없는 명사를 원인으로 추가하지 마세요."
+        )
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "system", "content": data_context},
-            {"role": "user", "content": message},
+            {"role": "user", "content": grounded_question},
         ]
 
-        res = requests.post(
-            f"{OLLAMA_HOST}/api/chat",
-            json={
-                "model": CHAT_MODEL,
-                "messages": messages,
-                "stream": False,
-                # 기본 num_ctx(2048)는 시군구별 전체 표를 담은 시스템 프롬프트보다 작아서
-                # 앞부분 데이터가 잘려나가 모델이 잘못된 값을 답하는 원인이 됨 -> 충분히 키움
-                # num_predict을 지정하지 않으면(-1) 입력+출력 합이 num_ctx를 넘는 순간
-                # 답변이 중간에 끊기므로, 입력에 쓰고 남는 만큼을 출력용으로 명시적으로 확보
-                "options": {"num_ctx": 16384, "num_predict": 1024},
-            },
-            timeout=120,
-        )
-        res.raise_for_status()
-        answer = res.json()["message"]["content"]
+        answer = _audit_demand_answer(_ollama_chat(messages))
 
         save_chat_log(message, answer, "ok")
         return jsonify({"status": "ok", "answer": answer})
@@ -594,6 +1089,9 @@ def chat():
     except requests.exceptions.ConnectionError:
         save_chat_log(message, None, "error: ollama_connection")
         return jsonify({"status": "error", "message": f"Ollama 서버({OLLAMA_HOST})에 연결할 수 없습니다."}), 500
+    except requests.exceptions.Timeout:
+        save_chat_log(message, None, "error: ollama_timeout")
+        return jsonify({"status": "error", "message": "AI 응답 시간이 초과되었습니다. 질문을 조금 짧게 다시 시도하세요."}), 504
     except Exception as e:
         save_chat_log(message, None, f"error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -608,6 +1106,8 @@ def guide_chat():
 
         if not message:
             return jsonify({"status": "error", "message": "메시지를 입력하세요."}), 400
+        if len(message) > CHAT_MAX_MESSAGE:
+            return jsonify({"status": "error", "message": f"질문은 {CHAT_MAX_MESSAGE}자 이내로 입력하세요."}), 400
 
         system_prompt = (
             "당신은 '첫 집 구매 가이드' 챗봇입니다. 사회초년생이나 생애 첫 주택 구매자가 막연하고 두려운 "
@@ -644,23 +1144,13 @@ def guide_chat():
             "반드시 한국어로만 답변하세요. 다른 언어(영어, 중국어, 일본어 등)는 절대 사용하지 마세요."
         )
 
+        system_prompt = GUIDE_CHAT_SYSTEM_PROMPT
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": message},
         ]
 
-        res = requests.post(
-            f"{OLLAMA_HOST}/api/chat",
-            json={
-                "model": CHAT_MODEL,
-                "messages": messages,
-                "stream": False,
-                "options": {"num_ctx": 16384, "num_predict": 1024},
-            },
-            timeout=120,
-        )
-        res.raise_for_status()
-        answer = res.json()["message"]["content"]
+        answer = _ollama_chat(messages, num_ctx=4096, num_predict=640)
 
         save_chat_log(message, answer, "ok", chat_type="guide")
         return jsonify({"status": "ok", "answer": answer})
@@ -668,6 +1158,9 @@ def guide_chat():
     except requests.exceptions.ConnectionError:
         save_chat_log(message, None, "error: ollama_connection", chat_type="guide")
         return jsonify({"status": "error", "message": f"Ollama 서버({OLLAMA_HOST})에 연결할 수 없습니다."}), 500
+    except requests.exceptions.Timeout:
+        save_chat_log(message, None, "error: ollama_timeout", chat_type="guide")
+        return jsonify({"status": "error", "message": "AI 응답 시간이 초과되었습니다. 질문을 조금 짧게 다시 시도하세요."}), 504
     except Exception as e:
         save_chat_log(message, None, f"error: {e}", chat_type="guide")
         return jsonify({"status": "error", "message": str(e)}), 500

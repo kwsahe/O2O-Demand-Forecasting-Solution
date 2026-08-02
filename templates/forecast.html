@@ -183,8 +183,9 @@
             main div[style*="display:grid"] > div,
             main div[style*="display: grid"] > div { min-width: 0; }
             #main-header { flex-wrap: wrap; row-gap: 10px; padding: 12px 16px; }
-            #main-header > div:last-child { flex-wrap: wrap; row-gap: 8px; gap: 10px !important; }
-            #main-header nav { order: 3; width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+            #main-header > div { min-width: 0; max-width: 100%; }
+            #main-header > div:last-child { width: 100%; flex-wrap: wrap; row-gap: 8px; gap: 10px !important; }
+            #main-header nav { order: 3; width: 100%; max-width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
             #main-header nav::-webkit-scrollbar { display: none; }
             #kpi-row { grid-template-columns: repeat(2, 1fr) !important; }
             #kpi-row > div { min-width: 0; }
@@ -215,6 +216,7 @@
             <a href="/" class="nav-link">대시보드</a>
             <a href="/analytics" class="nav-link">통계·분석</a>
             <a href="/forecast" class="nav-link active">수요 예측</a>
+            <a href="/region" class="nav-link">지역 분석</a>
             <a href="/guide" class="nav-link">구매 가이드</a>
         </nav>
         <div style="display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:11px;color:var(--green);">
@@ -350,9 +352,12 @@
     </div>
 </div>
 
-<!-- ── 실제값 vs 백테스트 예측 차트 ── -->
+<!-- ── 실제값 vs 백테스트·미래 예측 차트 ── -->
 <div id="chart-forecast-card" class="card anim-5" style="grid-column:1/-1;padding:22px;">
-    <div class="section-label">전국 월별 거래건수 — 실제값 vs 모델별 백테스트 예측</div>
+    <div class="section-label">전국 월별 거래건수 — 실제값 vs 모델별 예측</div>
+    <div id="forecastChartNote" style="font-size:11.5px;color:var(--text2);line-height:1.6;margin:-4px 0 14px;">
+        실제값 이후 구간은 전체 관측 데이터로 다시 학습한 미래 추정치입니다.
+    </div>
     <canvas id="forecastChart" height="110"></canvas>
 </div>
 
@@ -554,9 +559,18 @@ function renderForecastChart(data) {
     const ctx = document.getElementById('forecastChart').getContext('2d');
     if (forecastChartInst) forecastChartInst.destroy();
 
-    const labels = data.monthly.map(d => d.ym);
-    const actual = data.monthly.map(d => d.거래건수);
+    const fp = data.future_predictions || { future_ym: [] };
+    const observedLabels = data.monthly.map(d => d.ym);
+    const labels = observedLabels.concat(fp.future_ym || []);
+    const actual = data.monthly.map(d => d.거래건수)
+        .concat(new Array((fp.future_ym || []).length).fill(null));
     const testStartIdx = data.train_months;
+    const futureStartIdx = observedLabels.length;
+
+    const note = document.getElementById('forecastChartNote');
+    if (note && fp.future_ym && fp.future_ym.length) {
+        note.textContent = `실제값은 ${observedLabels.at(-1)}까지이며, ${fp.future_ym[0]}~${fp.future_ym.at(-1)}는 전체 관측 데이터로 다시 학습한 미래 추정치입니다.`;
+    }
 
     const datasets = [{
         label: '실제값',
@@ -571,10 +585,13 @@ function renderForecastChart(data) {
     for (const model of ['SARIMA', 'Prophet', 'LightGBM']) {
         const series = new Array(labels.length).fill(null);
         data.models[model].predictions.forEach((v, i) => { series[testStartIdx + i] = v; });
+        if (fp[model]) {
+            fp[model].forEach((v, i) => { series[futureStartIdx + i] = v; });
+        }
         // 직전 실제값에서 선이 이어지도록 연결점 추가
         if (testStartIdx > 0) series[testStartIdx - 1] = actual[testStartIdx - 1];
         datasets.push({
-            label: `${MODEL_LABEL[model]} (MAPE ${data.models[model].mape}%)`,
+            label: `${MODEL_LABEL[model]} (검증 MAPE ${data.models[model].mape}%)`,
             data: series,
             borderColor: MODEL_COLOR[model],
             backgroundColor: 'transparent',
@@ -663,6 +680,9 @@ function renderConclusion(data) {
     list.innerHTML = `
         <li><strong style="color:var(--accent);">${MODEL_LABEL[best]}</strong>가 검증 구간(마지막 ${data.test_months}개월)에서
             가장 낮은 MAPE(<strong>${data.models[best].mape}%</strong>)를 기록해 세 모델 중 가장 정확했습니다.</li>
+        ${data.baseline ? `<li>Naive Last Value 기준선의 MAPE는 <strong>${data.baseline.mape}%</strong>이며,
+            ${MODEL_LABEL[best]}는 이를 <strong>${data.baseline_improvement.absolute_mape_point}%p</strong>
+            (상대 ${data.baseline_improvement.relative_percent}%) 개선했습니다. 개선 폭이 크지 않다는 점도 함께 해석해야 합니다.</li>` : ''}
         <li>SARIMA(MAPE ${data.models.SARIMA.mape}%)는 추세를 안정적으로 따라가지만 계절성을 반영하지 않은 단순 ARIMA(1,1,1) 설정입니다.</li>
         <li>LightGBM(MAPE ${data.models.LightGBM.mape}%)은 학습 데이터가 6행뿐이라 일반화 성능을 신뢰하기 어렵습니다 — 데이터가 누적되면 재평가가 필요합니다.</li>
         <li>전체 데이터가 ${data.monthly.length}개월뿐이라 연간 계절성(예: 이사철 수요 증가) 추정은 제한적입니다. 24개월 이상 누적되면

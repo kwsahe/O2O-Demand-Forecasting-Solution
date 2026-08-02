@@ -1,0 +1,154 @@
+{
+  "method": "각 지표 가중치를 ±20% 변경한 뒤 전체 가중치 합을 1로 재정규화",
+  "regions": 102,
+  "scenario_count": 14,
+  "reconstructed_score_max_abs_diff": 0.005,
+  "summary": {
+    "minimum_spearman": 0.9948,
+    "minimum_top10_overlap_percent": 90,
+    "maximum_rank_change": 12,
+    "maximum_mean_absolute_score_change": 0.874
+  },
+  "scenarios": [
+    {
+      "metric": "거래건수",
+      "change": "-20%",
+      "spearman_rank_correlation": 0.999,
+      "top10_overlap_count": 9,
+      "top10_overlap_percent": 90,
+      "mean_absolute_score_change": 0.58,
+      "max_rank_change": 4,
+      "max_changed_region": "서울 동대문구"
+    },
+    {
+      "metric": "거래건수",
+      "change": "+20%",
+      "spearman_rank_correlation": 0.9986,
+      "top10_overlap_count": 9,
+      "top10_overlap_percent": 90,
+      "mean_absolute_score_change": 0.534,
+      "max_rank_change": 5,
+      "max_changed_region": "부산 동구"
+    },
+    {
+      "metric": "거래금액",
+      "change": "-20%",
+      "spearman_rank_correlation": 0.9984,
+      "top10_overlap_count": 9,
+      "top10_overlap_percent": 90,
+      "mean_absolute_score_change": 0.431,
+      "max_rank_change": 6,
+      "max_changed_region": "경기 과천시"
+    },
+    {
+      "metric": "거래금액",
+      "change": "+20%",
+      "spearman_rank_correlation": 0.998,
+      "top10_overlap_count": 9,
+      "top10_overlap_percent": 90,
+      "mean_absolute_score_change": 0.405,
+      "max_rank_change": 9,
+      "max_changed_region": "경기 과천시"
+    },
+    {
+      "metric": "노후도",
+      "change": "-20%",
+      "spearman_rank_correlation": 0.9948,
+      "top10_overlap_count": 9,
+      "top10_overlap_percent": 90,
+      "mean_absolute_score_change": 0.874,
+      "max_rank_change": 10,
+      "max_changed_region": "부산 동구"
+    },
+    {
+      "metric": "노후도",
+      "change": "+20%",
+      "spearman_rank_correlation": 0.9951,
+      "top10_overlap_count": 10,
+      "top10_overlap_percent": 100,
+      "mean_absolute_score_change": 0.82,
+      "max_rank_change": 12,
+      "max_changed_region": "경기 포천시"
+    },
+    {
+      "metric": "면적",
+      "change": "-20%",
+      "spearman_rank_correlation": 0.9974,
+      "top10_overlap_count": 9,
+      "top10_overlap_percent": 90,
+      "mean_absolute_score_change": 0.623,
+      "max_rank_change": 7,
+      "max_changed_region": "부산 강서구"
+    },
+    {
+      "metric": "면적",
+      "change": "+20%",
+      "spearman_rank_correlation": 0.9974,
+      "top10_overlap_count": 9,
+      "top10_overlap_percent": 90,
+      "mean_absolute_score_change": 0.597,
+      "max_rank_change": 8,
+      "max_changed_region": "울산 중구"
+    },
+    {
+      "metric": "신규입주",
+      "change": "-20%",
+      "spearman_rank_correlation": 0.9983,
+      "top10_overlap_count": 9,
+      "top10_overlap_percent": 90,
+      "mean_absolute_score_change": 0.364,
+      "max_rank_change": 9,
+      "max_changed_region": "경기 이천시"
+    },
+    {
+      "metric": "신규입주",
+      "change": "+20%",
+      "spearman_rank_correlation": 0.9979,
+      "top10_overlap_count": 10,
+      "top10_overlap_percent": 100,
+      "mean_absolute_score_change": 0.349,
+      "max_rank_change": 8,
+      "max_changed_region": "경기 의왕시"
+    },
+    {
+      "metric": "전월세거래건수",
+      "change": "-20%",
+      "spearman_rank_correlation": 0.9978,
+      "top10_overlap_count": 9,
+      "top10_overlap_percent": 90,
+      "mean_absolute_score_change": 0.587,
+      "max_rank_change": 7,
+      "max_changed_region": "경기 오산시"
+    },
+    {
+      "metric": "전월세거래건수",
+      "change": "+20%",
+      "spearman_rank_correlation": 0.9984,
+      "top10_overlap_count": 9,
+      "top10_overlap_percent": 90,
+      "mean_absolute_score_change": 0.539,
+      "max_rank_change": 7,
+      "max_changed_region": "경기 김포시"
+    },
+    {
+      "metric": "대수선이력",
+      "change": "-20%",
+      "spearman_rank_correlation": 0.9992,
+      "top10_overlap_count": 10,
+      "top10_overlap_percent": 100,
+      "mean_absolute_score_change": 0.118,
+      "max_rank_change": 6,
+      "max_changed_region": "경기 의왕시"
+    },
+    {
+      "metric": "대수선이력",
+      "change": "+20%",
+      "spearman_rank_correlation": 0.9996,
+      "top10_overlap_count": 10,
+      "top10_overlap_percent": 100,
+      "mean_absolute_score_change": 0.113,
+      "max_rank_change": 3,
+      "max_changed_region": "서울 동대문구"
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+venv
+.git
+.pytest_cache
+__pycache__
+*.pyc
+.env
+logs
+dashboard
+notebooks
+data/chat_history.db
+data/*.tmp

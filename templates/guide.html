@@ -290,8 +290,9 @@
             main div[style*="display:grid"] > div,
             main div[style*="display: grid"] > div { min-width: 0; }
             #main-header { flex-wrap: wrap; row-gap: 10px; padding: 12px 16px; }
-            #main-header > div:last-child { flex-wrap: wrap; row-gap: 8px; gap: 10px !important; }
-            #main-header nav { order: 3; width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+            #main-header > div { min-width: 0; max-width: 100%; }
+            #main-header > div:last-child { width: 100%; flex-wrap: wrap; row-gap: 8px; gap: 10px !important; }
+            #main-header nav { order: 3; width: 100%; max-width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
             #main-header nav::-webkit-scrollbar { display: none; }
         }
         @media (max-width: 480px) {
@@ -319,6 +320,7 @@
             <a href="/" class="nav-link">대시보드</a>
             <a href="/analytics" class="nav-link">통계·분석</a>
             <a href="/forecast" class="nav-link">수요 예측</a>
+            <a href="/region" class="nav-link">지역 분석</a>
             <a href="/guide" class="nav-link active">구매 가이드</a>
         </nav>
         <!-- 라이브 -->

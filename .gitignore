@@ -2,6 +2,11 @@
 data/*.csv
 data/*.db
 
+# 새로 clone해도 대시보드가 바로 열리도록 가벼운 결과물은 포함
+!data/인테리어_수요점수_결과.csv
+!data/시도별_수요집계_요약.csv
+!data/timeseries_forecast_result.json
+
 # 작업 중 디버그 산출물 (임시 텍스트/스크린샷)
 data/_*
 
@@ -27,3 +32,8 @@ devlog/
 
 # 로그 파일
 *.log
+logs/
+
+# 로컬 Codex/Claude 설정과 화면 검사용 임시 이미지
+.claude/
+dashboard/png/_check_*.png

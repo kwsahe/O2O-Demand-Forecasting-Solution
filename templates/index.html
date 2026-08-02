@@ -434,8 +434,9 @@
             main div[style*="display:grid"] > div,
             main div[style*="display: grid"] > div { min-width: 0; }
             #main-header { flex-wrap: wrap; row-gap: 10px; padding: 12px 16px; }
-            #main-header > div:last-child { flex-wrap: wrap; row-gap: 8px; gap: 10px !important; }
-            #main-header nav { order: 3; width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+            #main-header > div { min-width: 0; max-width: 100%; }
+            #main-header > div:last-child { width: 100%; flex-wrap: wrap; row-gap: 8px; gap: 10px !important; }
+            #main-header nav { order: 3; width: 100%; max-width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
             #main-header nav::-webkit-scrollbar { display: none; }
             #kpi-row { grid-template-columns: repeat(2, 1fr) !important; }
             #kpi-row > div { min-width: 0; }
@@ -469,12 +470,13 @@
             <a href="/" class="nav-link active">대시보드</a>
             <a href="/analytics" class="nav-link">통계·분석</a>
             <a href="/forecast" class="nav-link">수요 예측</a>
+            <a href="/region" class="nav-link">지역 분석</a>
             <a href="/guide" class="nav-link">구매 가이드</a>
         </nav>
         <!-- 데이터 기준 -->
         <div style="font-family:var(--mono);font-size:10px;color:var(--muted);display:flex;align-items:center;gap:5px;">
             <span style="color:var(--border2);">DATA</span>
-            <span>2025.01 – 2025.12</span>
+            <span>2025.07 – 2026.06</span>
         </div>
         <!-- 라이브 -->
         <div style="display:flex;align-items:center;gap:6px;font-family:var(--mono);font-size:11px;color:var(--green);">

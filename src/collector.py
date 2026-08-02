@@ -233,33 +233,69 @@ class ApartmentDataCollector:
             self._pdr = None
 
     def _fetch_one_from(self, url: str, sigungu_code: str, year_month: str) -> pd.DataFrame:
-        import requests
         import xml.etree.ElementTree as ET
 
+        page_size = 1000
         params = {
-        "serviceKey": self.api_key,
-        "LAWD_CD":    sigungu_code,
-        "DEAL_YMD":   year_month,
-        "numOfRows":  1000,
-        "pageNo":     1,
+            "serviceKey": self.api_key,
+            "LAWD_CD": sigungu_code,
+            "DEAL_YMD": year_month,
+            "numOfRows": page_size,
         }
 
         try:
-            res = requests.get(url, params=params, timeout=10)
-            root = ET.fromstring(res.text)
+            rows = []
+            page_no = 1
+            total_count = None
 
-            result_code = root.findtext(".//resultCode")
-            if result_code != "000":
-                result_msg = root.findtext(".//resultMsg")
-                print(f"  [API ERROR] {result_code}: {result_msg}")
-                return pd.DataFrame()
+            while total_count is None or len(rows) < total_count:
+                page_params = {**params, "pageNo": page_no}
+                res = requests.get(url, params=page_params, timeout=10)
+                res.raise_for_status()
+                root = ET.fromstring(res.text)
 
-            items = root.findall(".//item")
-            if not items:
-                return pd.DataFrame()
+                result_code = root.findtext(".//resultCode")
+                if result_code not in {"000", "00"}:
+                    result_msg = root.findtext(".//resultMsg")
+                    print(f"  [API ERROR] {result_code}: {result_msg}")
+                    empty = pd.DataFrame()
+                    empty.attrs["fetch_ok"] = False
+                    return empty
 
-            rows = [{child.tag: child.text for child in item} for item in items]
+                if total_count is None:
+                    total_text = root.findtext(".//totalCount")
+                    total_count = int(total_text) if total_text else 0
+
+                items = root.findall(".//item")
+                if not items:
+                    break
+
+                rows.extend(
+                    {child.tag: child.text for child in item}
+                    for item in items
+                )
+                if len(items) < page_size:
+                    break
+
+                page_no += 1
+                time.sleep(self.request_interval)
+
+            if not rows:
+                empty = pd.DataFrame()
+                empty.attrs["fetch_ok"] = True
+                return empty
+
+            if total_count and len(rows) < total_count:
+                print(
+                    f"  [INCOMPLETE] {sigungu_code}/{year_month}: "
+                    f"expected {total_count:,}, received {len(rows):,}"
+                )
+                empty = pd.DataFrame()
+                empty.attrs["fetch_ok"] = False
+                return empty
+
             df = pd.DataFrame(rows)
+            df.attrs["fetch_ok"] = True
 
             time.sleep(self.request_interval)
             df["수집_시군구코드"] = sigungu_code
@@ -267,8 +303,13 @@ class ApartmentDataCollector:
             return df
 
         except Exception as e:
-            print(f"  [ERROR] {sigungu_code} / {year_month} 수집 실패: {e}")
-            return pd.DataFrame()
+            print(
+                f"  [ERROR] {sigungu_code}/{year_month} 수집 실패: "
+                f"{type(e).__name__}"
+            )
+            empty = pd.DataFrame()
+            empty.attrs["fetch_ok"] = False
+            return empty
 
     def fetch_one(self, sigungu_code: str, year_month: str) -> pd.DataFrame:
         url = "https://apis.data.go.kr/1613000/RTMSDataSvcAptTradeDev/getRTMSDataSvcAptTradeDev"
@@ -299,6 +340,7 @@ class ApartmentDataCollector:
         months    = generate_year_months(start_ym, end_ym)
         total     = len(code_list) * len(months)
         collected = []
+        failed = []
         done      = 0
 
         print(f"[COLLECT] {len(code_list)}개 구 × {len(months)}개월 = 총 {total}회 호출 시작")
@@ -311,18 +353,32 @@ class ApartmentDataCollector:
                 print(f"  [{done:>3}/{total}] {name}({code}) / {ym} ...", end=" ")
 
                 df_chunk = fetch_fn(sigungu_code=code, year_month=ym)
+                fetch_ok = df_chunk.attrs.get("fetch_ok", True)
 
-                if not df_chunk.empty:
+                if not fetch_ok:
+                    failed.append((code, ym))
+                    print("실패")
+                elif not df_chunk.empty:
                     collected.append(df_chunk)
                     print(f"{len(df_chunk):,}건 OK")
                 else:
                     print("0건")
 
+        if failed:
+            preview = ", ".join(f"{code}/{ym}" for code, ym in failed[:10])
+            print(f"[ERROR] {len(failed)}개 지역-월 수집 실패: {preview}")
+            empty = pd.DataFrame()
+            empty.attrs["fetch_ok"] = False
+            return empty
+
         if not collected:
             print("[WARNING] 수집된 데이터가 없습니다. API 키를 확인하세요.")
-            return pd.DataFrame()
+            empty = pd.DataFrame()
+            empty.attrs["fetch_ok"] = True
+            return empty
 
         df_all = pd.concat(collected, ignore_index=True)
+        df_all.attrs["fetch_ok"] = True
         print(f"\n[COLLECT] 완료 - 총 {len(df_all):,}건 수집")
 
         if save_path:

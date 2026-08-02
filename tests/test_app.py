@@ -16,6 +16,7 @@ sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 import app as app_module
 
 DATA_MISSING = not os.path.exists("data/인테리어_수요점수_결과.csv")
+FORECAST_MISSING = not os.path.exists("data/timeseries_forecast_result.json")
 
 
 @pytest.fixture()
@@ -83,10 +84,122 @@ class TestHealthAndPages:
         assert res.status_code == 200
         assert res.get_json()["status"] == "ok"
 
-    @pytest.mark.parametrize("path", ["/", "/analytics", "/forecast", "/guide"])
+    @pytest.mark.parametrize("path", ["/", "/analytics", "/forecast", "/region", "/guide"])
     def test_pages_render(self, client, path):
         res = client.get(path)
         assert res.status_code == 200
+
+
+@pytest.mark.skipif(FORECAST_MISSING, reason="시계열 예측 결과 JSON 없음")
+class TestForecastApi:
+    def test_future_predictions_extend_through_2026_december(self, client):
+        res = client.get("/api/forecast")
+        body = res.get_json()
+
+        assert res.status_code == 200
+        assert body["status"] == "ok"
+        assert body["forecast_horizon"] == 6
+        assert body["future_predictions"]["future_ym"] == [
+            "2026-07", "2026-08", "2026-09",
+            "2026-10", "2026-11", "2026-12",
+        ]
+        for model in ["SARIMA", "Prophet", "LightGBM"]:
+            assert len(body["future_predictions"][model]) == 6
+
+
+@pytest.mark.skipif(DATA_MISSING, reason="지역 분석 결과 CSV 없음")
+class TestRegionApi:
+    def test_region_search_returns_exact_canonical_key(self, client):
+        res = client.get("/api/regions?q=강남")
+        body = res.get_json()
+
+        assert res.status_code == 200
+        assert body["status"] == "ok"
+        assert body["data"][0]["key"] == "서울|강남구"
+        assert body["data"][0]["codes"] == ["11680"]
+
+    def test_region_detail_rejects_free_text(self, client):
+        res = client.get("/api/region?key=강남구")
+        assert res.status_code == 400
+        assert res.get_json()["status"] == "error"
+
+    def test_region_detail_returns_analysis_payload(self, client):
+        res = client.get("/api/region?key=서울%7C강남구")
+        body = res.get_json()
+
+        assert res.status_code == 200
+        assert body["status"] == "ok"
+        assert body["summary"]["name"] == "서울 강남구"
+        assert body["coverage"]["end_ym"] == "202606"
+        assert len(body["trend"]) == 12
+        assert len(body["metrics"]) == 7
+        assert body["apartments"]
+
+    def test_region_insight_uses_selected_region(self, client, monkeypatch):
+        monkeypatch.setattr(app_module, "_ollama_chat", lambda *args, **kwargs: "확정 지표 기반 해설")
+        res = client.post("/api/region-insight", json={"key": "서울|강남구"})
+        body = res.get_json()
+
+        assert res.status_code == 200
+        assert body["status"] == "ok"
+        assert body["insight"] == "확정 지표 기반 해설"
+        assert body["model"] == app_module.CHAT_MODEL
+
+
+@pytest.mark.skipif(DATA_MISSING, reason="지역 분석 결과 CSV 없음")
+class TestLlmContext:
+    def test_demand_context_retrieves_only_relevant_region(self):
+        df = pd.read_csv(app_module.RESULT_PATH, encoding="utf-8-sig").sort_values(
+            "인테리어_수요점수", ascending=False
+        )
+        sido = pd.read_csv(app_module.SIDO_SUMMARY_PATH, encoding="utf-8-sig")
+
+        context = app_module.build_demand_context("강남구 수요 점수 알려줘", df, sido)
+
+        assert "강남구" in context
+        assert "질문에 언급된 시군구의 정확한 데이터" in context
+        assert len(context) < 5000
+
+    def test_chat_rejects_overlong_message_before_model_call(self, client):
+        res = client.post("/api/chat", json={"message": "가" * (app_module.CHAT_MAX_MESSAGE + 1)})
+        assert res.status_code == 400
+
+
+class TestOllamaClient:
+    def test_uses_low_variance_options_and_cleans_thinking(self, monkeypatch):
+        captured = {}
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"message": {"content": "<think>내부 추론</think>\n\n확정 답변"}}
+
+        def fake_post(url, json, timeout):
+            captured.update({"url": url, "payload": json, "timeout": timeout})
+            return FakeResponse()
+
+        monkeypatch.setattr(app_module.requests, "post", fake_post)
+        answer = app_module._ollama_chat([{"role": "user", "content": "질문"}])
+
+        assert answer == "확정 답변"
+        assert captured["payload"]["options"]["temperature"] == 0.15
+        assert captured["payload"]["options"]["seed"] == 42
+        assert captured["payload"]["keep_alive"] == "30m"
+
+    def test_demand_audit_removes_unsupported_region_story(self):
+        answer = (
+            "강남구 수요 점수는 43.8점입니다. "
+            "평균 거래금액은 275,271.6만원입니다. "
+            "고급 주거지로 알려져 있어 주민 투자 성향이 높습니다."
+        )
+
+        audited = app_module._audit_demand_answer(answer)
+
+        assert "43.8점" in audited
+        assert "275,271.6만원" in audited
+        assert "고급 주거지" not in audited
 
 
 class TestUpsertRaw:
@@ -132,6 +245,27 @@ class TestUpsertRaw:
         result = app_module._upsert_raw(str(existing_path), pd.DataFrame())
         assert len(result) == 1
         assert result.iloc[0]["val"] == "old1"
+
+    def test_replace_keys_removes_old_rows_when_new_result_is_zero(self, tmp_path):
+        existing_path = tmp_path / "existing.csv"
+        pd.DataFrame({
+            "수집_시군구코드": ["11110", "11140", "11110"],
+            "수집_연월": ["202601", "202601", "202512"],
+            "val": ["old-a", "old-zero-region", "keep"],
+        }).to_csv(existing_path, index=False, encoding="utf-8-sig")
+        new_data = pd.DataFrame({
+            "수집_시군구코드": ["11110"],
+            "수집_연월": ["202601"],
+            "val": ["new-a"],
+        })
+
+        result = app_module._upsert_raw(
+            str(existing_path),
+            new_data,
+            {("11110", "202601"), ("11140", "202601")},
+        )
+
+        assert set(result["val"]) == {"keep", "new-a"}
 
 
 class TestAtomicWriteCsv:
